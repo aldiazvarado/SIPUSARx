@@ -124,7 +124,7 @@
 
       // 2. Sinkronisasi realtime
       if (action === "checkRealtimeSync") {
-        if (onSuccess) onSuccess({ success: true, updated: false, data: appData });
+        if (onSuccess) onSuccess({ success: true, changed: false, updated: false, version: (appData && appData.version) || '1', data: appData });
         return;
       }
 
@@ -2892,19 +2892,47 @@
         }
       });
 
-      // Polling sinkronisasi real-time
-      setInterval(() => {
-        if (currentUser && typeof google !== 'undefined' && google.script && google.script.run) {
-          google.script.run
-            .withSuccessHandler(res => {
-              if (res && res.changed && res.success) {
-                appData = res;
-                refreshAllViews();
+      // Polling sinkronisasi real-time (juga cek otomatis saat kembali dari tab Google Sheets)
+      let isRealtimeSyncRunning = false;
+      let lastRealtimeSyncAt = 0;
+      function runRealtimeSyncCheck(force = false) {
+        if (!currentUser || typeof google === 'undefined' || !google.script || !google.script.run) return;
+        const nowTs = Date.now();
+        if (isRealtimeSyncRunning) return;
+        if (!force && nowTs - lastRealtimeSyncAt < 2000) return;
+
+        isRealtimeSyncRunning = true;
+        lastRealtimeSyncAt = nowTs;
+        const queryUser = currentUser.npm || currentUser.username || '';
+        const queryProdi = currentUser.kodeProdi || currentUser.prodi || '';
+
+        google.script.run
+          .withSuccessHandler(res => {
+            isRealtimeSyncRunning = false;
+            if (res && res.changed && res.success) {
+              appData = res;
+              if (!appData.master) appData.master = {};
+              if (!Array.isArray(appData.master.periode)) appData.master.periode = [];
+              if (!Array.isArray(appData.pendaftaran)) appData.pendaftaran = [];
+              if (typeof saveAppDataCache === 'function') saveAppDataCache(appData);
+              refreshAllViews();
+              const pendModal = document.getElementById('modalPendaftaran');
+              if (pendModal && !pendModal.classList.contains('hidden') && typeof syncPeriodeToPendaftaran === 'function') {
+                syncPeriodeToPendaftaran();
               }
-            })
-            .checkRealtimeSync(appData.version, currentUser.role, currentUser.username, currentUser.kodeProdi);
-        }
-      }, 7000);
+            }
+          })
+          .withFailureHandler(() => {
+            isRealtimeSyncRunning = false;
+          })
+          .checkRealtimeSync(appData.version, currentUser.role, queryUser, queryProdi);
+      }
+
+      setInterval(() => runRealtimeSyncCheck(true), 7000);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') runRealtimeSyncCheck(false);
+      });
+      window.addEventListener('focus', () => runRealtimeSyncCheck(false));
     });
 
     function checkStoredSession() {
@@ -7714,8 +7742,31 @@
         if (item) {
           const toDatetimeLocal = (val) => {
             if (!val) return '';
-            const s = String(val).trim().replace(' ', 'T');
-            return s.length >= 16 ? s.slice(0, 16) : s;
+            const pad2 = n => String(n).padStart(2, '0');
+            if (val instanceof Date && !isNaN(val.getTime())) {
+              return `${val.getFullYear()}-${pad2(val.getMonth() + 1)}-${pad2(val.getDate())}T${pad2(val.getHours())}:${pad2(val.getMinutes())}`;
+            }
+            const s = String(val).trim();
+            if (/[Zz]|[+-]\d{2}:?\d{2}$/.test(s)) {
+              const dt = new Date(s);
+              if (!isNaN(dt.getTime())) {
+                return `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}T${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`;
+              }
+            }
+            const isoM = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+            if (isoM) {
+              return `${isoM[1]}-${pad2(isoM[2])}-${pad2(isoM[3])}T${pad2(isoM[4] || '0')}:${pad2(isoM[5] || '0')}`;
+            }
+            const dmyM = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+            if (dmyM) {
+              return `${dmyM[3]}-${pad2(dmyM[2])}-${pad2(dmyM[1])}T${pad2(dmyM[4] || '0')}:${pad2(dmyM[5] || '0')}`;
+            }
+            const parsed = typeof parsePeriodeDateTime === 'function' ? parsePeriodeDateTime(s, false) : null;
+            if (parsed && !isNaN(parsed.getTime())) {
+              return `${parsed.getFullYear()}-${pad2(parsed.getMonth() + 1)}-${pad2(parsed.getDate())}T${pad2(parsed.getHours())}:${pad2(parsed.getMinutes())}`;
+            }
+            const fallback = s.replace(' ', 'T');
+            return fallback.length >= 16 ? fallback.slice(0, 16) : fallback;
           };
           if (selectTa && item['Tahun Akademik']) selectTa.value = item['Tahun Akademik'];
           document.getElementById('periodeSemester').value = item.Semester || 'Ganjil';
@@ -7730,11 +7781,15 @@
           document.getElementById('periodeStatus').value = st;
         }
       } else {
-        // Default tanggal: hari ini s/d 7 hari ke depan
+        // Default tanggal: hari ini s/d 7 hari ke depan (waktu lokal WIB, bukan UTC)
+        const fmtLocalInput = dt => {
+          const pad2 = n => String(n).padStart(2, '0');
+          return `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}T${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`;
+        };
         const now = new Date();
-        const startStr = now.toISOString().slice(0, 16);
+        const startStr = fmtLocalInput(now);
         const end = new Date(now.getTime() + 7 * 24 * 3600 * 1000);
-        const endStr = end.toISOString().slice(0, 16);
+        const endStr = fmtLocalInput(end);
         document.getElementById('periodeTglMulai').value = startStr;
         document.getElementById('periodeTglSelesai').value = endStr;
         document.getElementById('periodeBiaya').value = 50000;
@@ -11031,56 +11086,63 @@
       } else if (typeof val === 'string') {
         const clean = val.trim();
 
-        const idMonthMap = {
-          januari: 0, jan: 0,
-          februari: 1, feb: 1,
-          maret: 2, mar: 2,
-          april: 3, apr: 3,
-          mei: 4, may: 4,
-          juni: 5, jun: 5,
-          juli: 6, jul: 6,
-          agustus: 7, agu: 7, ags: 7, aug: 7,
-          september: 8, sep: 8,
-          oktober: 9, okt: 9, oct: 9,
-          november: 10, nov: 10,
-          desember: 11, des: 11, dec: 11
-        };
+        if (/[Zz]|[+-]\d{2}:?\d{2}$/.test(clean)) {
+          const tzDate = new Date(clean);
+          if (!isNaN(tzDate.getTime())) d = tzDate;
+        }
 
-        // Format Indonesia: e.g. [Minggu,] 15 November 2026 [Pukul 00:00[:00]]
-        const idMatch = clean.match(/^(?:[a-zA-Z]+,?\s+)?(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})(?:[^\d]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/i);
-        if (idMatch && idMonthMap[idMatch[2].toLowerCase()] !== undefined) {
-          const day = parseInt(idMatch[1], 10);
-          const m = idMonthMap[idMatch[2].toLowerCase()];
-          const y = parseInt(idMatch[3], 10);
-          const h = parseInt(idMatch[4] || '0', 10);
-          const min = parseInt(idMatch[5] || '0', 10);
-          const sec = parseInt(idMatch[6] || '0', 10);
-          d = new Date(y, m, day, h, min, sec);
-        } else {
-          // Format YYYY-MM-DD atau YYYY/MM/DD
-          const isoMatch = clean.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
-          if (isoMatch) {
-            const y = parseInt(isoMatch[1], 10);
-            const m = parseInt(isoMatch[2], 10) - 1;
-            const day = parseInt(isoMatch[3], 10);
-            const h = parseInt(isoMatch[4] || '0', 10);
-            const min = parseInt(isoMatch[5] || '0', 10);
-            const sec = parseInt(isoMatch[6] || '0', 10);
+        if (!d) {
+          const idMonthMap = {
+            januari: 0, jan: 0,
+            februari: 1, feb: 1,
+            maret: 2, mar: 2,
+            april: 3, apr: 3,
+            mei: 4, may: 4,
+            juni: 5, jun: 5,
+            juli: 6, jul: 6,
+            agustus: 7, agu: 7, ags: 7, aug: 7,
+            september: 8, sep: 8,
+            oktober: 9, okt: 9, oct: 9,
+            november: 10, nov: 10,
+            desember: 11, des: 11, dec: 11
+          };
+
+          // Format Indonesia: e.g. [Minggu,] 15 November 2026 [Pukul 00:00[:00]]
+          const idMatch = clean.match(/^(?:[a-zA-Z]+,?\s+)?(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})(?:[^\d]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/i);
+          if (idMatch && idMonthMap[idMatch[2].toLowerCase()] !== undefined) {
+            const day = parseInt(idMatch[1], 10);
+            const m = idMonthMap[idMatch[2].toLowerCase()];
+            const y = parseInt(idMatch[3], 10);
+            const h = parseInt(idMatch[4] || '0', 10);
+            const min = parseInt(idMatch[5] || '0', 10);
+            const sec = parseInt(idMatch[6] || '0', 10);
             d = new Date(y, m, day, h, min, sec);
           } else {
-            // Format DD-MM-YYYY atau DD/MM/YYYY
-            const dmyMatch = clean.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
-            if (dmyMatch) {
-              const day = parseInt(dmyMatch[1], 10);
-              const m = parseInt(dmyMatch[2], 10) - 1;
-              const y = parseInt(dmyMatch[3], 10);
-              const h = parseInt(dmyMatch[4] || '0', 10);
-              const min = parseInt(dmyMatch[5] || '0', 10);
-              const sec = parseInt(dmyMatch[6] || '0', 10);
+            // Format YYYY-MM-DD atau YYYY/MM/DD
+            const isoMatch = clean.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+            if (isoMatch) {
+              const y = parseInt(isoMatch[1], 10);
+              const m = parseInt(isoMatch[2], 10) - 1;
+              const day = parseInt(isoMatch[3], 10);
+              const h = parseInt(isoMatch[4] || '0', 10);
+              const min = parseInt(isoMatch[5] || '0', 10);
+              const sec = parseInt(isoMatch[6] || '0', 10);
               d = new Date(y, m, day, h, min, sec);
             } else {
-              const parsed = new Date(clean.replace(' ', 'T'));
-              if (!isNaN(parsed.getTime())) d = parsed;
+              // Format DD-MM-YYYY atau DD/MM/YYYY
+              const dmyMatch = clean.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+              if (dmyMatch) {
+                const day = parseInt(dmyMatch[1], 10);
+                const m = parseInt(dmyMatch[2], 10) - 1;
+                const y = parseInt(dmyMatch[3], 10);
+                const h = parseInt(dmyMatch[4] || '0', 10);
+                const min = parseInt(dmyMatch[5] || '0', 10);
+                const sec = parseInt(dmyMatch[6] || '0', 10);
+                d = new Date(y, m, day, h, min, sec);
+              } else {
+                const parsed = new Date(clean.replace(' ', 'T'));
+                if (!isNaN(parsed.getTime())) d = parsed;
+              }
             }
           }
         }

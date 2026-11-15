@@ -132,36 +132,127 @@ function bumpSyncVersion(actor, action) {
   }
 }
 
+function getActiveSpreadsheetSafe() {
+  var ss = null;
+  try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) {}
+  if (!ss) {
+    try {
+      var sheetId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+      if (sheetId) ss = SpreadsheetApp.openById(sheetId);
+    } catch (e2) {}
+  }
+  return ss;
+}
+
+function getSpreadsheetTimeZoneSafe(ss) {
+  try {
+    if (ss && typeof ss.getSpreadsheetTimeZone === 'function') {
+      var stz = ss.getSpreadsheetTimeZone();
+      if (stz) return stz;
+    }
+  } catch (e) {}
+  try {
+    var activeSs = getActiveSpreadsheetSafe();
+    if (activeSs && typeof activeSs.getSpreadsheetTimeZone === 'function') {
+      var atz = activeSs.getSpreadsheetTimeZone();
+      if (atz) return atz;
+    }
+  } catch (e2) {}
+  return Session.getScriptTimeZone() || 'Asia/Jakarta';
+}
+
+function computeSheetSnapshotHash(ss) {
+  try {
+    var targetSs = ss || getActiveSpreadsheetSafe();
+    if (!targetSs) return '0';
+    var parts = [];
+    var dynamicSheets = ['Periode_Pendaftaran', 'Master_Tahun_Akademik', 'Jadwal_Ujian', 'Pendaftaran'];
+    for (var s = 0; s < dynamicSheets.length; s++) {
+      var name = dynamicSheets[s];
+      var sh = targetSs.getSheetByName(name);
+      if (!sh) {
+        parts.push(name + ':missing');
+        continue;
+      }
+      var lastRow = sh.getLastRow();
+      var lastCol = sh.getLastColumn();
+      if (lastRow <= 0 || lastCol <= 0) {
+        parts.push(name + ':empty');
+        continue;
+      }
+      var maxRows = Math.min(lastRow, 1500);
+      var maxCols = Math.min(lastCol, 25);
+      var disp = sh.getRange(1, 1, maxRows, maxCols).getDisplayValues();
+      parts.push(name + ':' + lastRow + 'x' + lastCol + ':' + JSON.stringify(disp));
+    }
+    var masterSheets = ['Master_Prodi', 'Master_Matkul', 'Master_Kelas', 'Master_Dosen', 'Master_Ruangan', 'Notifikasi'];
+    for (var m = 0; m < masterSheets.length; m++) {
+      var mName = masterSheets[m];
+      var mSh = targetSs.getSheetByName(mName);
+      parts.push(mName + ':' + (mSh ? (mSh.getLastRow() + 'x' + mSh.getLastColumn()) : 'missing'));
+    }
+    var rawStr = parts.join('|');
+    var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, rawStr, Utilities.Charset.UTF_8);
+    var hex = '';
+    for (var i = 0; i < digest.length; i++) {
+      var byteVal = (digest[i] + 256) % 256;
+      hex += ('0' + byteVal.toString(16)).slice(-2);
+    }
+    return hex.slice(0, 16);
+  } catch (e) {
+    return '0';
+  }
+}
+
+function getCompositeSyncVersion(ss) {
+  return String(getSyncVersion()) + '_' + computeSheetSnapshotHash(ss);
+}
+
 function checkRealtimeSync(clientVersion, userRole, username, userProdi) {
   try {
-    var currentVer = getSyncVersion();
-    if (String(clientVersion) === String(currentVer)) {
+    var ss = getActiveSpreadsheetSafe();
+    var currentVer = getCompositeSyncVersion(ss);
+    if (String(clientVersion || '') === String(currentVer)) {
       return { changed: false, version: currentVer };
     }
     var props = PropertiesService.getScriptProperties();
+    var lastVerOnly = String(getSyncVersion());
+    var clientBaseVer = String(clientVersion || '').split('_')[0];
+    if (clientBaseVer === lastVerOnly) {
+      invalidateCache();
+    }
     var fresh = getInitialData(userRole, username, userProdi);
     fresh.changed = true;
     fresh.version = currentVer;
-    fresh.lastActor = props.getProperty('LAST_SYNC_ACTOR') || '';
-    fresh.lastAction = props.getProperty('LAST_SYNC_ACTION') || '';
+    fresh.lastActor = props.getProperty('LAST_SYNC_ACTOR') || 'Google Spreadsheet';
+    fresh.lastAction = props.getProperty('LAST_SYNC_ACTION') || 'Sinkronisasi Perubahan Spreadsheet';
     return fresh;
   } catch (err) {
     return { changed: false, message: err.message };
   }
 }
 
-function formatTimeOnly(d) {
+function formatTimeOnly(d, tz) {
   if (!d) return '';
+  var resolvedTz = tz || getSpreadsheetTimeZoneSafe();
   if (d instanceof Date) {
-    var h = ('0' + d.getHours()).slice(-2);
-    var m = ('0' + d.getMinutes()).slice(-2);
-    return h + ':' + m;
+    try {
+      return Utilities.formatDate(d, resolvedTz, 'HH:mm');
+    } catch (e) {
+      var h = ('0' + d.getHours()).slice(-2);
+      var m = ('0' + d.getMinutes()).slice(-2);
+      return h + ':' + m;
+    }
   }
   var s = String(d).trim();
   if (s.indexOf('1899') !== -1 || s.indexOf('1900') !== -1) {
     var dt = new Date(s);
     if (!isNaN(dt.getTime())) {
-      return ('0' + dt.getHours()).slice(-2) + ':' + ('0' + dt.getMinutes()).slice(-2);
+      try {
+        return Utilities.formatDate(dt, resolvedTz, 'HH:mm');
+      } catch (e2) {
+        return ('0' + dt.getHours()).slice(-2) + ':' + ('0' + dt.getMinutes()).slice(-2);
+      }
     }
   }
   var match = s.match(/(?:^|\s)?(\d{1,2})[:.](\d{2})(?::\d{2})?(?:\s*(?:WIB|WITA|WIT))?/i);
@@ -173,28 +264,72 @@ function formatTimeOnly(d) {
   return s;
 }
 
-function formatDateOnly(d) {
+function formatDateOnly(d, tz) {
   if (!d) return '';
+  var resolvedTz = tz || getSpreadsheetTimeZoneSafe();
   if (d instanceof Date) {
-    var y = d.getFullYear();
-    var m = ('0' + (d.getMonth() + 1)).slice(-2);
-    var day = ('0' + d.getDate()).slice(-2);
-    return y + '-' + m + '-' + day;
+    try {
+      return Utilities.formatDate(d, resolvedTz, 'yyyy-MM-dd');
+    } catch (e) {
+      var y = d.getFullYear();
+      var m = ('0' + (d.getMonth() + 1)).slice(-2);
+      var day = ('0' + d.getDate()).slice(-2);
+      return y + '-' + m + '-' + day;
+    }
   }
   var s = String(d).trim();
+  var isoM = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s].*)?$/);
+  if (isoM) {
+    return isoM[1] + '-' + ('0' + parseInt(isoM[2], 10)).slice(-2) + '-' + ('0' + parseInt(isoM[3], 10)).slice(-2);
+  }
+  var dmyM = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:[T\s].*)?$/);
+  if (dmyM) {
+    return dmyM[3] + '-' + ('0' + parseInt(dmyM[2], 10)).slice(-2) + '-' + ('0' + parseInt(dmyM[1], 10)).slice(-2);
+  }
   if (s.indexOf('T') !== -1) s = s.split('T')[0];
   if (s.indexOf(' ') !== -1 && s.indexOf(':') !== -1) s = s.split(' ')[0];
   return s;
 }
 
-function formatDateToString(d) {
+function normalizeNaiveDateTimeString(str) {
+  if (!str) return '';
+  var s = String(str).trim();
+  var isoM = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+  if (isoM) {
+    var yyyy = isoM[1];
+    var mm = ('0' + parseInt(isoM[2], 10)).slice(-2);
+    var dd = ('0' + parseInt(isoM[3], 10)).slice(-2);
+    var hh = ('0' + parseInt(isoM[4] || '0', 10)).slice(-2);
+    var min = ('0' + parseInt(isoM[5] || '0', 10)).slice(-2);
+    var sec = ('0' + parseInt(isoM[6] || '0', 10)).slice(-2);
+    return yyyy + '-' + mm + '-' + dd + ' ' + hh + ':' + min + ':' + sec;
+  }
+  var dmyM = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+  if (dmyM) {
+    var dd2 = ('0' + parseInt(dmyM[1], 10)).slice(-2);
+    var mm2 = ('0' + parseInt(dmyM[2], 10)).slice(-2);
+    var yyyy2 = dmyM[3];
+    var hh2 = ('0' + parseInt(dmyM[4] || '0', 10)).slice(-2);
+    var min2 = ('0' + parseInt(dmyM[5] || '0', 10)).slice(-2);
+    var sec2 = ('0' + parseInt(dmyM[6] || '0', 10)).slice(-2);
+    return yyyy2 + '-' + mm2 + '-' + dd2 + ' ' + hh2 + ':' + min2 + ':' + sec2;
+  }
+  return '';
+}
+
+function formatDateToString(d, tz) {
   if (!d) return '';
+  var resolvedTz = tz || getSpreadsheetTimeZoneSafe();
   if (typeof d === 'string') {
     var str = d.trim();
     if (str.indexOf('1899') !== -1 || str.indexOf('1900') !== -1) {
-      return formatTimeOnly(str);
+      return formatTimeOnly(str, resolvedTz);
     }
-    if (str.indexOf('AM') !== -1 || str.indexOf('PM') !== -1 || str.indexOf('am') !== -1 || str.indexOf('pm') !== -1) {
+    var naiveNorm = normalizeNaiveDateTimeString(str);
+    if (naiveNorm) {
+      return naiveNorm;
+    }
+    if (str.indexOf('AM') !== -1 || str.indexOf('PM') !== -1 || str.indexOf('am') !== -1 || str.indexOf('pm') !== -1 || /[Zz]$|[+-]\d{2}:?\d{2}$/.test(str) || str.indexOf('GMT') !== -1) {
       var dateParsed = new Date(str);
       if (!isNaN(dateParsed.getTime())) {
         d = dateParsed;
@@ -208,11 +343,10 @@ function formatDateToString(d) {
   
   try {
     if (d.getFullYear && d.getFullYear() < 1920) {
-      return formatTimeOnly(d);
+      return formatTimeOnly(d, resolvedTz);
     }
-    var tz = Session.getScriptTimeZone() || 'Asia/Jakarta';
     try {
-      return Utilities.formatDate(d, tz, 'yyyy-MM-dd HH:mm:ss');
+      return Utilities.formatDate(d, resolvedTz, 'yyyy-MM-dd HH:mm:ss');
     } catch(e) {
       var year = d.getFullYear();
       var month = ('0' + (d.getMonth() + 1)).slice(-2);
@@ -294,31 +428,54 @@ function getSheetDataRaw(ss, sheetName) {
     return [];
   }
   
-  var values = sheet.getDataRange().getValues();
+  var range = sheet.getDataRange();
+  var values = range.getValues();
   if (values.length <= 1) return [];
+  var displayValues = [];
+  try { displayValues = range.getDisplayValues(); } catch (e) { displayValues = []; }
+  var tz = getSpreadsheetTimeZoneSafe(ss);
   
   var headers = values[0];
   var data = new Array(values.length - 1);
   for (var i = 1; i < values.length; i++) {
     var row = values[i];
+    var dispRow = displayValues[i] || [];
     var obj = {};
     for (var j = 0; j < headers.length; j++) {
       var key = String(headers[j]).trim();
       var keyLower = key.toLowerCase();
       var val = row[j];
+      var disp = dispRow[j] !== undefined && dispRow[j] !== null ? String(dispRow[j]).trim() : '';
+      var isPeriodDateTimeCol = (keyLower.indexOf('tanggal') !== -1 && keyLower.indexOf('jam') !== -1) ||
+                                keyLower === 'mulai terlambat' ||
+                                keyLower === 'selesai terlambat' ||
+                                keyLower === 'tanggal mulai' ||
+                                keyLower === 'tanggal selesai';
+      var isTimeOnlyCol = (keyLower === 'jam mulai' || keyLower === 'jam selesai' ||
+                          (keyLower.indexOf('jam') !== -1 && keyLower.indexOf('mulai') === -1 && keyLower.indexOf('selesai') === -1 && keyLower.indexOf('tanggal') === -1));
+      var isDateOnlyCol = (keyLower === 'tanggal ujian' || keyLower === 'tanggal');
+
       if (val instanceof Date) {
-        if (keyLower.indexOf('tanggal') !== -1 && keyLower.indexOf('jam') !== -1) {
-          val = formatDateToString(val);
-        } else if (keyLower.indexOf('jam') !== -1 && keyLower.indexOf('mulai') === -1 && keyLower.indexOf('selesai') === -1) {
-          val = formatTimeOnly(val);
-        } else if (keyLower === 'tanggal ujian' || keyLower === 'tanggal') {
-          val = formatDateOnly(val);
+        if (isPeriodDateTimeCol) {
+          var dispDtNorm = normalizeNaiveDateTimeString(disp);
+          val = dispDtNorm || formatDateToString(val, tz);
+        } else if (isTimeOnlyCol) {
+          val = /^\d{1,2}[:.]\d{2}(?::\d{2})?$/.test(disp) ? formatTimeOnly(disp, tz) : formatTimeOnly(val, tz);
+        } else if (isDateOnlyCol) {
+          if (/^(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4})$/.test(disp)) {
+            val = formatDateOnly(disp, tz);
+          } else {
+            val = formatDateOnly(val, tz);
+          }
         } else {
-          val = formatDateToString(val);
+          var dispOtherNorm = normalizeNaiveDateTimeString(disp);
+          val = dispOtherNorm || formatDateToString(val, tz);
         }
       } else if (typeof val === 'string') {
-        if (keyLower.indexOf('tanggal') === -1 && keyLower.indexOf('mulai') === -1 && keyLower.indexOf('selesai') === -1 && keyLower.indexOf('jam') !== -1) {
-          val = formatTimeOnly(val);
+        if (isPeriodDateTimeCol) {
+          val = formatDateToString(disp || val, tz);
+        } else if (isTimeOnlyCol) {
+          val = formatTimeOnly(disp || val, tz);
         }
       }
       obj[key] = val;
@@ -486,12 +643,13 @@ function getSheetData(sheetName) {
     var data = isStaticMaster ? getCachedMasterData(ss, sheetName) : getSheetDataRaw(ss, sheetName);
     if (!data) data = [];
 
+    var tz = getSpreadsheetTimeZoneSafe(ss);
     if (sheetName === 'Periode_Pendaftaran') {
       data.forEach(function(item) {
-        item['Tanggal & Jam Mulai'] = formatDateToString(item['Tanggal & Jam Mulai'] || item['Tanggal Mulai'] || '');
-        item['Tanggal & Jam Selesai'] = formatDateToString(item['Tanggal & Jam Selesai'] || item['Tanggal Selesai'] || '');
-        item['Mulai Terlambat'] = formatDateToString(item['Mulai Terlambat'] || '');
-        item['Selesai Terlambat'] = formatDateToString(item['Selesai Terlambat'] || '');
+        item['Tanggal & Jam Mulai'] = formatDateToString(item['Tanggal & Jam Mulai'] || item['Tanggal Mulai'] || '', tz);
+        item['Tanggal & Jam Selesai'] = formatDateToString(item['Tanggal & Jam Selesai'] || item['Tanggal Selesai'] || '', tz);
+        item['Mulai Terlambat'] = formatDateToString(item['Mulai Terlambat'] || '', tz);
+        item['Selesai Terlambat'] = formatDateToString(item['Selesai Terlambat'] || '', tz);
         item['Kategori Kelas'] = item['Kategori Kelas'] || item['Kelas'] || 'Reguler & Karyawan';
         var rawBiaya = item['Biaya Keterlambatan'] !== undefined ? item['Biaya Keterlambatan'] : (item['Biaya'] || 0);
         item['Biaya Keterlambatan'] = sanitizeNumber(rawBiaya);
@@ -1111,7 +1269,7 @@ function getInitialData(userRole, username, userProdi) {
 
     return {
       success: true,
-      version: getSyncVersion(),
+      version: getCompositeSyncVersion(getActiveSpreadsheetSafe()),
       master: {
         prodi: masterProdi,
         matkul: masterMatkul,
@@ -1720,16 +1878,20 @@ function addPeriode(payload) {
 
     var maxCol = Math.max(sheet.getLastColumn(), 11);
     var rowData = new Array(maxCol).fill('');
+    var fmtDt = function(v) {
+      var raw = String(v || '').trim().replace('T', ' ');
+      return normalizeNaiveDateTimeString(raw) || raw;
+    };
 
     rowData[0] = newId;
     rowData[1] = payload.tahunAkademik || '2026/2027';
     rowData[2] = payload.semester || 'Ganjil';
     rowData[3] = payload.jenisLayanan;
     rowData[4] = payload.kategoriKelas;
-    rowData[5] = String(payload.tglMulai || '').replace('T', ' ');
-    rowData[6] = String(payload.tglSelesai || '').replace('T', ' ');
-    rowData[7] = String(payload.tglTerlambatMulai || '').replace('T', ' ');
-    rowData[8] = String(payload.tglTerlambatSelesai || '').replace('T', ' ');
+    rowData[5] = fmtDt(payload.tglMulai);
+    rowData[6] = fmtDt(payload.tglSelesai);
+    rowData[7] = fmtDt(payload.tglTerlambatMulai);
+    rowData[8] = fmtDt(payload.tglTerlambatSelesai);
     rowData[9] = cleanBiaya;
     rowData[10] = cleanStatus;
 
@@ -1738,10 +1900,10 @@ function addPeriode(payload) {
     if (headerMap['Semester']) rowData[headerMap['Semester'] - 1] = payload.semester || 'Ganjil';
     if (headerMap['Jenis Layanan']) rowData[headerMap['Jenis Layanan'] - 1] = payload.jenisLayanan;
     if (headerMap['Kategori Kelas']) rowData[headerMap['Kategori Kelas'] - 1] = payload.kategoriKelas;
-    if (headerMap['Tanggal & Jam Mulai'] || headerMap['Tanggal Mulai']) rowData[(headerMap['Tanggal & Jam Mulai'] || headerMap['Tanggal Mulai']) - 1] = String(payload.tglMulai || '').replace('T', ' ');
-    if (headerMap['Tanggal & Jam Selesai'] || headerMap['Tanggal Selesai']) rowData[(headerMap['Tanggal & Jam Selesai'] || headerMap['Tanggal Selesai']) - 1] = String(payload.tglSelesai || '').replace('T', ' ');
-    if (headerMap['Mulai Terlambat']) rowData[headerMap['Mulai Terlambat'] - 1] = String(payload.tglTerlambatMulai || '').replace('T', ' ');
-    if (headerMap['Selesai Terlambat']) rowData[headerMap['Selesai Terlambat'] - 1] = String(payload.tglTerlambatSelesai || '').replace('T', ' ');
+    if (headerMap['Tanggal & Jam Mulai'] || headerMap['Tanggal Mulai']) rowData[(headerMap['Tanggal & Jam Mulai'] || headerMap['Tanggal Mulai']) - 1] = fmtDt(payload.tglMulai);
+    if (headerMap['Tanggal & Jam Selesai'] || headerMap['Tanggal Selesai']) rowData[(headerMap['Tanggal & Jam Selesai'] || headerMap['Tanggal Selesai']) - 1] = fmtDt(payload.tglSelesai);
+    if (headerMap['Mulai Terlambat']) rowData[headerMap['Mulai Terlambat'] - 1] = fmtDt(payload.tglTerlambatMulai);
+    if (headerMap['Selesai Terlambat']) rowData[headerMap['Selesai Terlambat'] - 1] = fmtDt(payload.tglTerlambatSelesai);
     if (headerMap['Biaya Keterlambatan'] || headerMap['Biaya']) rowData[(headerMap['Biaya Keterlambatan'] || headerMap['Biaya']) - 1] = cleanBiaya;
     if (headerMap['Status']) rowData[headerMap['Status'] - 1] = cleanStatus;
 
@@ -1807,14 +1969,18 @@ function updatePeriode(arg1, arg2) {
       }
     }
 
+    var fmtUpDt = function(v) {
+      var raw = String(v || '').trim().replace('T', ' ');
+      return normalizeNaiveDateTimeString(raw) || raw;
+    };
     setCol('Tahun Akademik', payload.tahunAkademik || '2026/2027');
     setCol('Semester', payload.semester || 'Ganjil');
     setCol('Jenis Layanan', payload.jenisLayanan);
     setCol('Kategori Kelas', payload.kategoriKelas);
-    setCol('Tanggal & Jam Mulai', String(payload.tglMulai || '').replace('T', ' '));
-    setCol('Tanggal & Jam Selesai', String(payload.tglSelesai || '').replace('T', ' '));
-    setCol('Mulai Terlambat', String(payload.tglTerlambatMulai || '').replace('T', ' '));
-    setCol('Selesai Terlambat', String(payload.tglTerlambatSelesai || '').replace('T', ' '));
+    setCol('Tanggal & Jam Mulai', fmtUpDt(payload.tglMulai));
+    setCol('Tanggal & Jam Selesai', fmtUpDt(payload.tglSelesai));
+    setCol('Mulai Terlambat', fmtUpDt(payload.tglTerlambatMulai));
+    setCol('Selesai Terlambat', fmtUpDt(payload.tglTerlambatSelesai));
     setCol('Biaya Keterlambatan', cleanBiaya);
     setCol('Status', cleanStatus);
 
